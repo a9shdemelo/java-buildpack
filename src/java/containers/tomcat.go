@@ -1,0 +1,748 @@
+package containers
+
+import (
+	"bytes"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/cloudfoundry/java-buildpack/src/java/common"
+	"github.com/cloudfoundry/java-buildpack/src/java/resources"
+	"github.com/cloudfoundry/libbuildpack"
+)
+
+// TomcatContainer handles servlet/WAR applications
+type TomcatContainer struct {
+	context *common.Context
+	config  *tomcatConfig
+}
+
+// NewTomcatContainer creates a new Tomcat container
+func NewTomcatContainer(ctx *common.Context) *TomcatContainer {
+	return &TomcatContainer{
+		context: ctx,
+	}
+}
+
+// Detect checks if this is a Tomcat/servlet application
+func (t *TomcatContainer) Detect() (string, error) {
+	buildDir := t.context.Stager.BuildDir()
+
+	// Check for WEB-INF directory (exploded WAR)
+	webInf := filepath.Join(buildDir, "WEB-INF")
+	if _, err := os.Stat(webInf); err == nil {
+		t.context.Log.Debug("Detected WAR application via WEB-INF directory")
+		return "Tomcat", nil
+	}
+
+	// Check for WAR files
+	matches, err := filepath.Glob(filepath.Join(buildDir, "*.war"))
+	if err == nil && len(matches) > 0 {
+		t.context.Log.Debug("Detected WAR file: %s", matches[0])
+		return "Tomcat", nil
+	}
+
+	return "", nil
+}
+
+// Supply installs Tomcat and dependencies
+func (t *TomcatContainer) Supply() error {
+	t.context.Log.BeginStep("Supplying Tomcat")
+
+	// Determine Java version to select appropriate Tomcat version
+	// Tomcat 10.x requires Java 11+, Tomcat 9.x supports Java 8-22
+	javaHome := os.Getenv("JAVA_HOME")
+	var dep libbuildpack.Dependency
+	var err error
+
+	t.config, err = t.loadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load tomcat config: %w", err)
+	}
+
+	if javaHome != "" {
+		versionPattern, versionErr := SelectTomcatVersionPattern(javaHome, DetermineTomcatVersion(t.config.Tomcat.Version))
+		if versionErr != nil {
+			return versionErr
+		}
+
+		if versionPattern != "" {
+			allVersions := t.context.Manifest.AllDependencyVersions("tomcat")
+			resolvedVersion, err := libbuildpack.FindMatchingVersion(versionPattern, allVersions)
+			if err != nil {
+				return fmt.Errorf("tomcat version resolution error for pattern %q: %w", versionPattern, err)
+			}
+			dep.Name = "tomcat"
+			dep.Version = resolvedVersion
+			t.context.Log.Debug("Resolved Tomcat version pattern '%s' to %s", versionPattern, resolvedVersion)
+		} else {
+			t.context.Log.Warning("Unable to determine Java version from JAVA_HOME, falling back to manifest default Tomcat version")
+		}
+	}
+
+	// Fallback to default version if we couldn't determine Java version
+	if dep.Version == "" {
+		dep, err = t.context.Manifest.DefaultVersion("tomcat")
+		if err != nil {
+			return fmt.Errorf("failed to determine Tomcat version: no JAVA_HOME set and no default version in manifest: %w", err)
+		}
+	}
+
+	// Install Tomcat with strip components to remove the top-level directory
+	// Apache Tomcat tarballs extract to apache-tomcat-X.Y.Z/ subdirectory
+	tomcatDir := t.tomcatDir()
+	if err := t.context.Installer.InstallDependencyWithStrip(dep, tomcatDir, 1); err != nil {
+		return fmt.Errorf("failed to install Tomcat: %w", err)
+	}
+
+	t.context.Log.Info("Installed Tomcat (%s)", dep.Version)
+
+	// Get buildpack index for multi-buildpack support
+	depsIdx := t.context.Stager.DepsIdx()
+	// Write profile.d script to set CATALINA_HOME, CATALINA_BASE, and JAVA_OPTS at runtime
+	tomcatPath := fmt.Sprintf("$DEPS_DIR/%s/tomcat", depsIdx)
+
+	// Determine access logging configuration (default: disabled, matching Ruby buildpack)
+	// Can be enabled via: JBP_CONFIG_TOMCAT='{access_logging_support: {access_logging: enabled}}'
+	accessLoggingEnabled := t.isAccessLoggingEnabled()
+
+	// Add http.port system property to JAVA_OPTS so Tomcat uses $PORT for the HTTP connector
+	// Add access.logging.enabled to control CloudFoundryAccessLoggingValve
+	// These are required for Cloud Foundry where the platform assigns a dynamic port
+	envContent := fmt.Sprintf(`export CATALINA_HOME=%s
+export CATALINA_BASE=%s
+export JAVA_OPTS="${JAVA_OPTS:+$JAVA_OPTS }-Dhttp.port=$PORT -Daccess.logging.enabled=%s"
+`, tomcatPath, tomcatPath, accessLoggingEnabled)
+
+	if err := t.context.Stager.WriteProfileD("tomcat.sh", envContent); err != nil {
+		t.context.Log.Warning("Could not write tomcat.sh profile.d script: %s", err.Error())
+	} else {
+		t.context.Log.Debug("Created profile.d script: tomcat.sh")
+	}
+
+	// Install Tomcat support libraries (lifecycle, access-logging, and logging)
+	// These are ALWAYS required for proper Tomcat initialization with Cloud Foundry
+	if err := t.installTomcatLifecycleSupport(); err != nil {
+		return fmt.Errorf("failed to install Tomcat lifecycle support: %w", err)
+	}
+
+	if err := t.installTomcatAccessLoggingSupport(); err != nil {
+		return fmt.Errorf("failed to install Tomcat access logging support: %w", err)
+	}
+
+	loggingSupportJar, err := t.installTomcatLoggingSupport()
+	if err != nil {
+		return fmt.Errorf("failed to install Tomcat logging support: %w", err)
+	}
+
+	// Create setenv.sh in tomcat/bin to add logging support JAR to CLASSPATH
+	// Tomcat's catalina.sh automatically sources setenv.sh if it exists
+	// This ensures the logging JAR is on the classpath before Tomcat's logging initializes
+	if err := t.createSetenvScript(tomcatDir, loggingSupportJar); err != nil {
+		return fmt.Errorf("failed to create setenv.sh: %w", err)
+	}
+
+	// Install default Cloud Foundry-optimized Tomcat configuration (unless external config is used)
+	if err := t.installDefaultConfiguration(tomcatDir); err != nil {
+		return fmt.Errorf("failed to install default Tomcat configuration: %w", err)
+	}
+
+	// Install external Tomcat configuration if enabled (overrides defaults)
+	if err := t.installExternalConfiguration(tomcatDir); err != nil {
+		return fmt.Errorf("failed to install external Tomcat configuration: %w", err)
+	}
+
+	// JVMKill agent is installed and configured by JRE component
+
+	return nil
+}
+
+// installTomcatLifecycleSupport installs Tomcat lifecycle support library to tomcat/lib
+func (t *TomcatContainer) installTomcatLifecycleSupport() error {
+	dep, err := t.context.Manifest.DefaultVersion("tomcat-lifecycle-support")
+	if err != nil {
+		return err
+	}
+
+	// InstallDependency for JAR files (non-archives) copies the file to the target directory
+	// The JAR will be placed in tomcat/lib/ as tomcat/lib/tomcat-lifecycle-support-X.Y.Z.RELEASE.jar
+	tomcatDir := filepath.Join(t.tomcatDir())
+	libDir := filepath.Join(tomcatDir, "lib")
+
+	// Ensure lib directory exists
+	if err := os.MkdirAll(libDir, 0755); err != nil {
+		return fmt.Errorf("failed to create tomcat lib directory: %w", err)
+	}
+
+	if err := t.context.Installer.InstallDependency(dep, libDir); err != nil {
+		return fmt.Errorf("failed to install Tomcat lifecycle support: %w", err)
+	}
+
+	t.context.Log.Info("Successfully installed Tomcat Lifecycle Support %s to tomcat/lib", dep.Version)
+	return nil
+}
+
+// installTomcatAccessLoggingSupport installs Tomcat access logging support library to tomcat/lib
+func (t *TomcatContainer) installTomcatAccessLoggingSupport() error {
+	dep, err := t.context.Manifest.DefaultVersion("tomcat-access-logging-support")
+	if err != nil {
+		return err
+	}
+
+	// InstallDependency for JAR files (non-archives) copies the file to the target directory
+	// The JAR will be placed in tomcat/lib/ as tomcat/lib/tomcat-access-logging-support-X.Y.Z.RELEASE.jar
+	tomcatDir := filepath.Join(t.tomcatDir())
+	libDir := filepath.Join(tomcatDir, "lib")
+
+	// Ensure lib directory exists
+	if err := os.MkdirAll(libDir, 0755); err != nil {
+		return fmt.Errorf("failed to create tomcat lib directory: %w", err)
+	}
+
+	if err := t.context.Installer.InstallDependency(dep, libDir); err != nil {
+		return fmt.Errorf("failed to install Tomcat access logging support: %w", err)
+	}
+
+	t.context.Log.Info("Successfully installed Tomcat Access Logging Support %s to tomcat/lib", dep.Version)
+	return nil
+}
+
+// installTomcatLoggingSupport installs Tomcat logging support library to tomcat/bin
+// This JAR must be on the classpath BEFORE Tomcat's logging initializes
+// Returns the JAR filename so it can be added to CLASSPATH in profile.d script
+func (t *TomcatContainer) installTomcatLoggingSupport() (string, error) {
+	dep, err := t.context.Manifest.DefaultVersion("tomcat-logging-support")
+	if err != nil {
+		return "", err
+	}
+
+	// InstallDependency for JAR files (non-archives) copies the file to the target directory
+	// The JAR will be placed in tomcat/bin/ as tomcat/bin/tomcat-logging-support-X.Y.Z.RELEASE.jar
+	tomcatDir := filepath.Join(t.tomcatDir())
+	binDir := filepath.Join(tomcatDir, "bin")
+
+	// Ensure bin directory exists
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create tomcat bin directory: %w", err)
+	}
+
+	if err := t.context.Installer.InstallDependency(dep, binDir); err != nil {
+		return "", fmt.Errorf("failed to install Tomcat logging support: %w", err)
+	}
+
+	entry, err := t.context.Manifest.GetEntry(dep)
+	if err != nil {
+		return "", fmt.Errorf("failed to get manifest entry for tomcat-logging-support: %w", err)
+	}
+
+	jarName := filepath.Base(entry.URI)
+	t.context.Log.Info("Successfully installed Tomcat Logging Support %s to tomcat/bin (contains CloudFoundryConsoleHandler)", dep.Version)
+	return jarName, nil
+}
+
+// createSetenvScript creates a setenv.sh script in tomcat/bin to add logging support JAR to CLASSPATH
+// Tomcat's catalina.sh automatically sources setenv.sh if it exists
+func (t *TomcatContainer) createSetenvScript(tomcatDir, loggingSupportJar string) error {
+	binDir := filepath.Join(tomcatDir, "bin")
+	setenvPath := filepath.Join(binDir, "setenv.sh")
+
+	jarPath := "$CATALINA_HOME/bin/" + loggingSupportJar
+	// Note that Tomcat builds its own CLASSPATH env before starting. It ensures that any user defined CLASSPATH variables
+	// are not used on startup, as can be seen in the catalina.sh script. That is why even we have something already
+	// sourced in CLASSPATH env from profile.d scripts it is disregarded on Tomcat startup and fresh CLASSPATH env is
+	// built here in the setenv.sh script.
+	setenvContent := fmt.Sprintf(`#!/bin/sh
+CLASSPATH="%s${CONTAINER_SECURITY_PROVIDER:+:$CONTAINER_SECURITY_PROVIDER}"
+`, jarPath)
+
+	if err := os.WriteFile(setenvPath, []byte(setenvContent), 0755); err != nil {
+		return fmt.Errorf("failed to write setenv.sh: %w", err)
+	}
+
+	t.context.Log.Info("Created setenv.sh with logging JAR on boot classpath")
+	return nil
+}
+
+// installExternalConfiguration installs external Tomcat configuration if enabled
+func (t *TomcatContainer) installExternalConfiguration(tomcatDir string) error {
+	// Check if external configuration is enabled
+	externalConfigEnabled, repositoryRoot, version := t.isExternalConfigurationEnabled()
+
+	if !externalConfigEnabled {
+		t.context.Log.Debug("External Tomcat configuration is disabled, using defaults only")
+		return nil
+	}
+
+	t.context.Log.Info("External Tomcat configuration is enabled, will overlay on top of defaults")
+
+	if repositoryRoot == "" {
+		t.context.Log.Warning("External configuration enabled but repository_root not set")
+		t.context.Log.Warning("To use external Tomcat configuration, you must:")
+		t.context.Log.Warning("  1. Fork this buildpack and add external config to manifest.yml")
+		t.context.Log.Warning("  2. Or use a custom buildpack with external configuration included")
+		return nil
+	}
+
+	if version == "" {
+		version = "1.0.0" // default version
+	}
+
+	t.context.Log.Info("External configuration repository: %s (version: %s)", repositoryRoot, version)
+
+	// Try to install from manifest first if available
+	// This will work if the user has added the external configuration to their forked buildpack manifest
+	dep, err := t.context.Manifest.DefaultVersion("tomcat-external-configuration")
+	if err != nil {
+		// Manifest entry not found - download directly from repository_root
+		t.context.Log.Info("External configuration not in manifest, downloading directly from repository")
+		return t.downloadExternalConfiguration(repositoryRoot, version, tomcatDir)
+	}
+
+	t.context.Log.Info("Downloading external Tomcat configuration version %s from manifest", dep.Version)
+
+	// Install external configuration with strip=0 to overlay onto Tomcat directory
+	// The external config archive has structure: ./conf/...
+	// We extract directly to tomcatDir (no stripping needed)
+	if err := t.context.Installer.InstallDependencyWithStrip(dep, tomcatDir, 0); err != nil {
+		return fmt.Errorf("failed to install external configuration: %w", err)
+	}
+
+	t.context.Log.Info("Installed external Tomcat configuration version %s (overlaid on defaults)", dep.Version)
+	return nil
+}
+
+// downloadExternalConfiguration downloads external Tomcat configuration by first fetching
+// index.yml to lookup the actual download URL for the specified version
+func (t *TomcatContainer) downloadExternalConfiguration(repositoryRoot, version, tomcatDir string) error {
+	// Step 1: Download and parse index.yml from repository_root
+	indexURL := fmt.Sprintf("%s/index.yml", repositoryRoot)
+	t.context.Log.Info("Fetching external configuration index from: %s", indexURL)
+
+	indexResp, err := http.Get(indexURL)
+	if err != nil {
+		return fmt.Errorf("failed to download index.yml: %w", err)
+	}
+	defer indexResp.Body.Close()
+
+	if indexResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download index.yml: HTTP %d", indexResp.StatusCode)
+	}
+
+	// Read and parse index.yml
+	indexData, err := io.ReadAll(indexResp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read index.yml: %w", err)
+	}
+
+	// Parse YAML as map[string]string (version -> URL)
+	var index map[string]string
+	yamlHandler := common.YamlHandler{}
+	if err := yamlHandler.Unmarshal(indexData, &index); err != nil {
+		return fmt.Errorf("failed to parse index.yml: %w", err)
+	}
+
+	// Step 2: Look up the download URL for the requested version
+	downloadURL, found := index[version]
+	if !found {
+		return fmt.Errorf("version %s not found in index.yml (available versions: %v)", version, getKeys(index))
+	}
+
+	t.context.Log.Info("Found version %s in index, downloading from: %s", version, downloadURL)
+
+	// Step 3: Download the configuration archive
+	tmpFile, err := os.CreateTemp("", "tomcat-external-config-*.tar.gz")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	resp, err := http.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("failed to download external configuration: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download external configuration: HTTP %d", resp.StatusCode)
+	}
+
+	// Write response to temp file
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		return fmt.Errorf("failed to write external configuration to temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	// Step 4: Extract the archive to tomcatDir with strip=0
+	// The external config archive has structure: ./conf/...
+	// We extract directly to tomcatDir (no stripping needed)
+	t.context.Log.Info("Extracting external configuration to: %s", tomcatDir)
+	if err := libbuildpack.ExtractTarGzWithStrip(tmpFile.Name(), tomcatDir, 0); err != nil {
+		return fmt.Errorf("failed to extract external configuration: %w", err)
+	}
+
+	t.context.Log.Info("Successfully installed external Tomcat configuration version %s (overlaid on defaults)", version)
+	return nil
+}
+
+// installDefaultConfiguration installs embedded Cloud Foundry-optimized Tomcat configuration
+// These defaults provide proper CF integration (dynamic ports, stdout logging, X-Forwarded-* headers, etc.)
+// External configuration (if enabled) will be layered on top of these defaults
+func (t *TomcatContainer) installDefaultConfiguration(tomcatDir string) error {
+	t.context.Log.Info("Installing Cloud Foundry-optimized Tomcat configuration defaults")
+
+	confDir := filepath.Join(tomcatDir, "conf")
+	if err := os.MkdirAll(confDir, 0755); err != nil {
+		return fmt.Errorf("failed to create conf directory: %w", err)
+	}
+
+	// Install embedded configuration files
+	configFiles := []string{
+		"tomcat/conf/server.xml",
+		"tomcat/conf/logging.properties",
+		"tomcat/conf/context.xml",
+	}
+
+	for _, configFile := range configFiles {
+		data, err := resources.GetResource(configFile)
+		if err != nil {
+			t.context.Log.Warning("Embedded config %s not found: %s", configFile, err)
+			continue
+		}
+
+		targetPath := filepath.Join(confDir, filepath.Base(configFile))
+		if err := os.WriteFile(targetPath, data, 0644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", filepath.Base(configFile), err)
+		}
+
+		t.context.Log.Info("Installed default %s to %s", filepath.Base(configFile), targetPath)
+	}
+
+	t.context.Log.Info("Tomcat configuration includes:")
+	t.context.Log.Info("  - Dynamic port binding (${http.port} from $PORT)")
+	t.context.Log.Info("  - HTTP/2 support enabled")
+	t.context.Log.Info("  - RemoteIpValve for X-Forwarded-* headers")
+	t.context.Log.Info("  - CloudFoundryAccessLoggingValve with vcap_request_id")
+	t.context.Log.Info("  - Stdout logging via CloudFoundryConsoleHandler")
+
+	return nil
+}
+
+// getKeys returns the keys of a map as a slice (for error messages)
+func getKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// SelectTomcatVersionPattern determines the Tomcat version pattern to use based on the
+// detected Java version and any user-configured Tomcat version.
+// Returns ("", nil) when Java version cannot be determined — the caller should fall back
+// to the manifest default (matching Ruby buildpack behaviour).
+func SelectTomcatVersionPattern(javaHome, configVersion string) (string, error) {
+	if javaHome == "" {
+		return "", nil
+	}
+
+	javaMajorVersion, err := common.DetermineJavaVersion(javaHome)
+	if err != nil {
+		if configVersion != "" {
+			return configVersion, nil
+		}
+		return "", nil
+	}
+
+	if configVersion != "" {
+		if strings.HasPrefix(configVersion, "10.") && javaMajorVersion < 11 {
+			return "", fmt.Errorf("Tomcat 10.x requires Java 11+, but Java %d detected", javaMajorVersion)
+		}
+		return configVersion, nil
+	}
+
+	if javaMajorVersion >= 11 {
+		return "10.x", nil
+	}
+	return "9.x", nil
+}
+
+
+// based on the JBP_CONFIG_TOMCAT field from manifest.
+// It looks for a tomcat block with a version of the form "<major>.+" (e.g. "9.+", "10.+", "10.1.+").
+// Returns the pattern with "+" replaced by "*" (e.g. "9.*", "10.*", "10.1.*") so libbuildpack can resolve it.
+// Masterminds/semver treats x, X, and * as equivalent wildcards.
+func DetermineTomcatVersion(version string) string {
+	// Replace "+" with "*" so libbuildpack's FindMatchingVersion can resolve it.
+	// e.g. "9.+" -> "9.*", "10.+" -> "10.*", "10.1.+" -> "10.1.*"
+	return strings.ReplaceAll(version, "+", "*")
+}
+
+// isAccessLoggingEnabled checks if access logging is enabled in configuration
+// Returns: "true" or "false" as a string (for use in JAVA_OPTS)
+// Default: "false" (disabled, matching Ruby buildpack behavior)
+// Can be enabled via: JBP_CONFIG_TOMCAT='{access_logging_support: {access_logging: enabled}}'
+func (t *TomcatContainer) isAccessLoggingEnabled() string {
+	// Check for JBP_CONFIG_TOMCAT environment variable
+	if t.config.AccessLoggingSupport.AccessLogging == "enabled" || t.config.AccessLoggingSupport.AccessLogging == "true" {
+		t.context.Log.Info("Access logging enabled via JBP_CONFIG_TOMCAT")
+		return "true"
+	}
+
+	t.context.Log.Info("Access logging disabled by default (use JBP_CONFIG_TOMCAT to enable)")
+	return "false"
+}
+
+// isExternalConfigurationEnabled checks if external configuration is enabled in config
+// Returns: (enabled bool, repositoryRoot string, version string)
+func (t *TomcatContainer) isExternalConfigurationEnabled() (bool, string, string) {
+	if t.config.Tomcat.ExternalConfigurationEnabled {
+		repositoryRoot := t.config.ExternalConfiguration.RepositoryRoot
+		version := t.config.ExternalConfiguration.Version
+		return true, repositoryRoot, version
+	}
+
+	// Default to false (disabled)
+	return false, "", ""
+}
+
+func injectDocBase(xmlContent string, docBase string) string {
+	idx := strings.Index(xmlContent, "<Context")
+	if idx == -1 {
+		return xmlContent
+	}
+
+	endIdx := strings.Index(xmlContent[idx:], ">")
+	if endIdx == -1 {
+		return xmlContent
+	}
+	endIdx += idx
+
+	contextTag := xmlContent[idx:endIdx]
+
+	for strings.Contains(contextTag, "docBase=") {
+		docBaseIdx := strings.Index(contextTag, "docBase=")
+
+		if docBaseIdx+8 >= len(contextTag) {
+			break
+		}
+		quote := contextTag[docBaseIdx+8]
+		if quote != '"' && quote != '\'' {
+			break
+		}
+
+		endQuoteIdx := strings.Index(contextTag[docBaseIdx+9:], string(quote))
+		if endQuoteIdx == -1 {
+			break
+		}
+		endQuoteIdx += docBaseIdx + 9
+
+		before := strings.TrimSpace(contextTag[:docBaseIdx])
+		after := strings.TrimSpace(contextTag[endQuoteIdx+1:])
+		if before != "" && after != "" {
+			contextTag = before + " " + after
+		} else {
+			contextTag = before + after
+		}
+	}
+
+	newContextTag := strings.Replace(contextTag, "<Context", `<Context docBase="`+docBase+`"`, 1)
+
+	return xmlContent[:idx] + newContextTag + xmlContent[endIdx:]
+}
+
+// contextXMLFilename converts a context path to a Tomcat context XML filename.
+// Tomcat convention: /foo/bar → foo#bar.xml, / or empty → ROOT.xml
+func contextXMLFilename(contextPath string) string {
+	name := strings.Trim(contextPath, "/")
+	if name == "" {
+		return "ROOT.xml"
+	}
+	name = strings.ReplaceAll(name, "/", "#")
+	return name + ".xml"
+}
+
+// Finalize performs final Tomcat configuration
+func (t *TomcatContainer) Finalize() error {
+	t.context.Log.BeginStep("Finalizing Tomcat")
+
+	if t.config == nil {
+		var err error
+		t.config, err = t.loadConfig()
+		if err != nil {
+			return fmt.Errorf("failed to load tomcat config: %w", err)
+		}
+	}
+
+	buildDir := t.context.Stager.BuildDir()
+	contextXMLName := contextXMLFilename(t.config.Tomcat.ContextPath)
+	contextXMLPath := filepath.Join(t.tomcatDir(), "conf", "Catalina", "localhost", contextXMLName)
+
+	webInf := filepath.Join(buildDir, "WEB-INF")
+	_, webInfErr := os.Stat(webInf)
+	if webInfErr != nil && !os.IsNotExist(webInfErr) {
+		return fmt.Errorf("failed to check WEB-INF directory: %w", webInfErr)
+	}
+	if webInfErr == nil {
+		// the script name is prefixed with 'zzz' as it is important to be the last script sourced from profile.d
+		// so that the previous scripts assembling the CLASSPATH variable(left from frameworks) are sourced previous to it.
+		if err := t.context.Stager.WriteProfileD("zzz_classpath_symlinks.sh", fmt.Sprintf(symlinkScript, filepath.Join("WEB-INF", "lib"))); err != nil {
+			return fmt.Errorf("failed to write zzz_classpath_symlinks.sh: %w", err)
+		}
+
+		contextXMLDir := filepath.Dir(contextXMLPath)
+		if err := os.MkdirAll(contextXMLDir, 0755); err != nil {
+			return fmt.Errorf("failed to create context directory: %w", err)
+		}
+
+		_, statErr := os.Stat(contextXMLPath)
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return fmt.Errorf("failed to check context XML %s: %w", contextXMLName, statErr)
+		}
+		if os.IsNotExist(statErr) {
+			appContextXML := filepath.Join(buildDir, "META-INF", "context.xml")
+			var contextContent string
+
+			_, appStatErr := os.Stat(appContextXML)
+			if appStatErr != nil && !os.IsNotExist(appStatErr) {
+				// A non-IsNotExist error (permissions/IO) must not be silently
+				// treated as "no context.xml" — that would drop user-provided
+				// Realm/Resource config. Surface it.
+				return fmt.Errorf("failed to check META-INF/context.xml: %w", appStatErr)
+			}
+			if appStatErr == nil {
+				xmlBytes, err := os.ReadFile(appContextXML)
+				if err != nil {
+					return fmt.Errorf("failed to read META-INF/context.xml: %w", err)
+				}
+
+				xmlStr := string(xmlBytes)
+				xmlStr = strings.TrimSpace(xmlStr)
+
+				contextContent = injectDocBase(xmlStr, "${user.home}/app")
+				t.context.Log.Info("Merged META-INF/context.xml with %s - realm and resource configurations preserved", contextXMLName)
+			} else {
+				contextContent = fmt.Sprintf("<Context docBase=\"${user.home}/app\" reloadable=\"false\">\n</Context>\n")
+				t.context.Log.Info("Created %s with docBase pointing to application directory", contextXMLName)
+			}
+
+			if err := os.WriteFile(contextXMLPath, []byte(contextContent), 0644); err != nil {
+				return fmt.Errorf("failed to write %s: %w", contextXMLName, err)
+			}
+		} else {
+			t.context.Log.Info("Context XML %s already exists (e.g. from external config), skipping generation", contextXMLName)
+		}
+		if contextXMLName != "ROOT.xml" {
+			rootXMLPath := filepath.Join(t.tomcatDir(), "conf", "Catalina", "localhost", "ROOT.xml")
+			if err := os.Remove(rootXMLPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("failed to remove ROOT.xml: %w", err)
+			}
+		}
+	} else {
+		warMatches, err := filepath.Glob(filepath.Join(buildDir, "*.war"))
+		if err != nil {
+			return fmt.Errorf("failed to find WAR files in build directory: %w", err)
+		}
+		if len(warMatches) == 1 {
+			warFilename := filepath.Base(warMatches[0])
+			// Escape XML-sensitive characters (&, <, >, ", ') so a WAR filename
+			// containing them cannot produce an invalid Tomcat context descriptor.
+			var escapedWarFilename bytes.Buffer
+			if err := xml.EscapeText(&escapedWarFilename, []byte(warFilename)); err != nil {
+				return fmt.Errorf("failed to XML-escape WAR filename %q: %w", warFilename, err)
+			}
+			contextContent := fmt.Sprintf("<Context docBase=\"${user.home}/app/%s\" reloadable=\"false\">\n</Context>\n", escapedWarFilename.String())
+
+			contextXMLDir := filepath.Dir(contextXMLPath)
+			if err := os.MkdirAll(contextXMLDir, 0755); err != nil {
+				return fmt.Errorf("failed to create context directory: %w", err)
+			}
+
+			_, statErr := os.Stat(contextXMLPath)
+			if statErr != nil && !os.IsNotExist(statErr) {
+				return fmt.Errorf("failed to check context XML %s: %w", contextXMLName, statErr)
+			}
+			if os.IsNotExist(statErr) {
+				if err := os.WriteFile(contextXMLPath, []byte(contextContent), 0644); err != nil {
+					return fmt.Errorf("failed to write %s: %w", contextXMLName, err)
+				}
+				t.context.Log.Info("Created %s with docBase pointing to %s", contextXMLName, warFilename)
+			} else {
+				t.context.Log.Info("Context XML %s already exists (e.g. from external config), skipping generation", contextXMLName)
+			}
+			if contextXMLName != "ROOT.xml" {
+				rootXMLPath := filepath.Join(t.tomcatDir(), "conf", "Catalina", "localhost", "ROOT.xml")
+				if err := os.Remove(rootXMLPath); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("failed to remove ROOT.xml: %w", err)
+				}
+			}
+		} else if len(warMatches) > 1 {
+			t.context.Log.Warning("Multiple WAR files found in build directory; cannot determine which to deploy, skipping context descriptor generation")
+		}
+	}
+
+	return nil
+}
+
+// Release returns the Tomcat startup command
+func (t *TomcatContainer) Release() (string, error) {
+	// Use $CATALINA_HOME environment variable set by profile.d script
+	// Profile.d scripts run BEFORE the release command at runtime (same as $JAVA_HOME)
+	cmd := "$CATALINA_HOME/bin/catalina.sh run"
+
+	return cmd, nil
+}
+
+func (t *TomcatContainer) tomcatDir() string {
+	return filepath.Join(t.context.Stager.DepDir(), "tomcat")
+}
+
+func (t *TomcatContainer) loadConfig() (*tomcatConfig, error) {
+	tConfig := tomcatConfig{
+		Tomcat: Tomcat{
+			Version:                      "",
+			ExternalConfigurationEnabled: false,
+		},
+		ExternalConfiguration: ExternalConfiguration{
+			Version:        "",
+			RepositoryRoot: "",
+		},
+		AccessLoggingSupport: AccessLoggingSupport{
+			AccessLogging: "disabled",
+		},
+	}
+	config := os.Getenv("JBP_CONFIG_TOMCAT")
+	if config != "" {
+		yamlHandler := common.YamlHandler{}
+		// overlay JBP_CONFIG_TOMCAT over default values
+		if err := yamlHandler.Unmarshal([]byte(config), &tConfig); err != nil {
+			return nil, fmt.Errorf("failed to parse JBP_CONFIG_TOMCAT: %w", err)
+		}
+	}
+	return &tConfig, nil
+}
+
+type tomcatConfig struct {
+	Tomcat                Tomcat                `yaml:"tomcat"`
+	ExternalConfiguration ExternalConfiguration `yaml:"external_configuration"`
+	AccessLoggingSupport  AccessLoggingSupport  `yaml:"access_logging_support"`
+}
+
+type Tomcat struct {
+	Version                      string `yaml:"version"`
+	ExternalConfigurationEnabled bool   `yaml:"external_configuration_enabled"`
+	ContextPath                  string `yaml:"context_path"`
+}
+
+type ExternalConfiguration struct {
+	Version        string `yaml:"version"`
+	RepositoryRoot string `yaml:"repository_root"`
+}
+
+type AccessLoggingSupport struct {
+	AccessLogging string `yaml:"access_logging"`
+}

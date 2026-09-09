@@ -1,0 +1,149 @@
+package frameworks
+
+import (
+	"fmt"
+	"github.com/cloudfoundry/java-buildpack/src/java/common"
+	"path/filepath"
+)
+
+// OpenTelemetryJavaagentFramework implements OpenTelemetry instrumentation support
+type OpenTelemetryJavaagentFramework struct {
+	context *common.Context
+	jarPath string
+}
+
+// NewOpenTelemetryJavaagentFramework creates a new OpenTelemetry Javaagent framework instance
+func NewOpenTelemetryJavaagentFramework(ctx *common.Context) *OpenTelemetryJavaagentFramework {
+	return &OpenTelemetryJavaagentFramework{context: ctx}
+}
+
+// Detect checks if OpenTelemetry should be included
+func (o *OpenTelemetryJavaagentFramework) Detect() (string, error) {
+	// Check for OpenTelemetry service binding
+	vcapServices, err := GetVCAPServices()
+	if err != nil {
+		o.context.Log.Warning("Failed to parse VCAP_SERVICES: %s", err.Error())
+		return "", nil
+	}
+
+	// OpenTelemetry can be bound as:
+	// - "otel-collector" service (required by Ruby implementation)
+	// - Services with "otel" or "opentelemetry" tag
+	// - User-provided services with "otel-collector" in the name (Docker platform)
+	if vcapServices.HasService("otel-collector") ||
+		vcapServices.HasService("opentelemetry") ||
+		vcapServices.HasTag("otel") ||
+		vcapServices.HasTag("otel-collector") ||
+		vcapServices.HasTag("opentelemetry") ||
+		vcapServices.HasServiceByNamePattern("otel-collector") ||
+		vcapServices.HasServiceByNamePattern("otel") {
+		o.context.Log.Info("OpenTelemetry service detected!")
+		return "OpenTelemetry Javaagent", nil
+	}
+
+	o.context.Log.Debug("OpenTelemetry not detected")
+	return "", nil
+}
+
+// Supply installs the OpenTelemetry Javaagent
+func (o *OpenTelemetryJavaagentFramework) Supply() error {
+	o.context.Log.Debug("Installing OpenTelemetry Javaagent")
+
+	// Get OpenTelemetry agent dependency from manifest
+	dep, err := o.context.Manifest.DefaultVersion("open-telemetry-javaagent")
+	if err != nil {
+		return fmt.Errorf("unable to determine OpenTelemetry version: %w", err)
+	}
+
+	// Install OpenTelemetry agent JAR
+	agentDir := filepath.Join(o.context.Stager.DepDir(), "open_telemetry_javaagent")
+	if err := o.context.Installer.InstallDependency(dep, agentDir); err != nil {
+		return fmt.Errorf("failed to install OpenTelemetry agent: %w", err)
+	}
+
+	o.context.Log.Debug("Installed OpenTelemetry Javaagent version %s", dep.Version)
+	return nil
+}
+
+// Finalize performs final OpenTelemetry configuration
+func (o *OpenTelemetryJavaagentFramework) Finalize() error {
+	// Get buildpack index for multi-buildpack support
+	depsIdx := o.context.Stager.DepsIdx()
+
+	agentDir := filepath.Join(o.context.Stager.DepDir(), "open_telemetry_javaagent")
+
+	err := o.constructJarPath(agentDir)
+	if err != nil {
+		return fmt.Errorf("OTEL Java agent JAR path not found during finalize: %w", err)
+	}
+
+	relPath, err := filepath.Rel(o.context.Stager.DepDir(), o.jarPath)
+	if err != nil {
+		return fmt.Errorf("failed to determine relative path for OTEL Java agent: %w", err)
+	}
+
+	// Build runtime agent path
+	agentJar := filepath.Join(fmt.Sprintf("$DEPS_DIR/%s", depsIdx), relPath)
+
+	// Add javaagent to JAVA_OPTS
+	javaOpts := fmt.Sprintf("-javaagent:%s", agentJar)
+
+	// Get OpenTelemetry configuration from service binding
+	vcapServices, _ := GetVCAPServices()
+
+	// Try to find service by various patterns
+	service := vcapServices.GetService("otel-collector")
+	if service == nil {
+		service = vcapServices.GetService("opentelemetry")
+	}
+	if service == nil {
+		service = vcapServices.GetServiceByNamePattern("otel-collector")
+	}
+	if service == nil {
+		service = vcapServices.GetServiceByNamePattern("otel")
+	}
+
+	// Add all otel.* credentials from the service bind as JVM system properties
+	if service != nil && service.Credentials != nil {
+		for key, value := range service.Credentials {
+			// Only add properties that start with "otel."
+			if len(key) >= 5 && key[:5] == "otel." {
+				javaOpts += fmt.Sprintf(" -D%s=%v", key, value)
+			}
+		}
+
+		// Set otel.service.name to the application name if not specified in credentials
+		if _, hasServiceName := service.Credentials["otel.service.name"]; !hasServiceName {
+			// Use the build directory name as the application name
+			if appName := GetApplicationName(false); appName != "" {
+				javaOpts += fmt.Sprintf(" -Dotel.service.name=%s", appName)
+			}
+		}
+	}
+
+	// Write to .opts file using priority 36
+	if err := writeJavaOptsFile(o.context, 36, "open_telemetry_javaagent", javaOpts); err != nil {
+		return fmt.Errorf("failed to write java_opts file: %w", err)
+	}
+
+	o.context.Log.Debug("OpenTelemetry Javaagent configured (priority 36)")
+	return nil
+}
+
+func (o *OpenTelemetryJavaagentFramework) constructJarPath(agentDir string) error {
+	jarPattern := filepath.Join(agentDir, o.DependencyIdentifier()+"*.jar")
+	matches, err := filepath.Glob(jarPattern)
+	if err != nil {
+		return fmt.Errorf("failed to search for OTEL javaagent jar: %w", err)
+	}
+	if len(matches) == 0 {
+		return fmt.Errorf("otel agent jar not found after installation in %s", agentDir)
+	}
+	o.jarPath = matches[0]
+	return nil
+}
+
+func (o *OpenTelemetryJavaagentFramework) DependencyIdentifier() string {
+	return "open-telemetry-javaagent"
+}
+

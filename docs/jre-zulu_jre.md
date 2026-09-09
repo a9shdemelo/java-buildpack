@@ -23,10 +23,10 @@ For general information on configuring the buildpack, including how to specify c
 
 The JRE can be configured by modifying the [`config/zulu_jre.yml`][] file in the buildpack fork.  The JRE uses the [`Repository` utility support][repositories] and so, it supports the [version syntax][]  defined there.
 
-To use Zulu JRE instead of OpenJDK without forking java-buildpack, set environment variable and restage:
+To use Zulu JRE instead of OpenJDK, set environment variable and restage:
 
 ```bash
-cf set-env <app_name> JBP_CONFIG_COMPONENTS '{jres: ["JavaBuildpack::Jre::ZuluJRE"]}'
+cf set-env <app_name> JBP_CONFIG_ZULU_JRE '{jre: {version: 17.+}}'
 cf restage <app_name>
 ```
 
@@ -35,17 +35,23 @@ cf restage <app_name>
 | `jre.repository_root` | The URL of the Zulu repository index ([details][repositories]).
 | `jre.version` | The version of Java runtime to use. Note: version 1.8.0 and higher require the `memory_sizes` and `memory_heuristics` mappings to specify `metaspace` rather than `permgen`.
 | `jvmkill.repository_root` | The URL of the `jvmkill` repository index ([details][repositories]).
-| `jvmkill.version` | The version of `jvmkill` to use.  Candidate versions can be found in the listings for [bionic][jvmkill-bionic].
+| `jvmkill.version` | The version of `jvmkill` to use.  Candidate versions can be found in the listings for [jammy][jvmkill-jammy].
 | `memory_calculator` | Memory calculator defaults, described below under "Memory".
 
 ### Additional Resources
-The JRE can also be configured by overlaying a set of resources on the default distribution. To do this, add files to the `resources/zulu_jre` directory in the buildpack fork.
+
+**Note:** The `resources/zulu_jre` directory approach from the Ruby buildpack (2013-2025) is no longer supported. This was a **buildpack-level** feature where teams would fork the java-buildpack repository, add custom files to `resources/zulu_jre/`, and package their custom buildpack. The Go buildpack does not package the `resources/` directory.
 
 #### JCE Unlimited Strength
-To add the JCE Unlimited Strength `local_policy.jar`, add your file to `resources/zulu_jre/lib/security/local_policy.jar`.  This file will be overlayed onto the Zulu distribution.
+To add custom JCE Unlimited Strength files, you must:
+1. Fork the buildpack repository
+2. Add your `local_policy.jar` to the appropriate location in your fork
+3. Modify `manifest.yml` to include your custom files in the buildpack package
+4. Package and install your custom buildpack to Cloud Foundry
 
 #### Custom CA Certificates
-To add custom SSL certificates, add your `cacerts` file to `resources/zulu_jre/lib/security/cacerts`.  This file will be overlayed onto the Zulu distribution.
+
+**Recommended approach:** Use [Cloud Foundry Trusted System Certificates](https://docs.cloudfoundry.org/devguide/deploy-apps/trusted-system-certificates.html). Cloud Foundry operators can deploy trusted certificates that are automatically available to all apps in `/etc/cf-system-certificates` and `/etc/ssl/certs`. The JRE automatically trusts certificates in `/etc/ssl/certs`. **This is the standard Cloud Foundry approach and works for all apps.**
 
 ### `jvmkill`
 The `jvmkill` agent runs when an application has experience a resource exhaustion event.  When this event occurs, the agent will print out a histogram of the first 100 largest types by total number of bytes.
@@ -164,7 +170,7 @@ JVM Memory Configuration: -XX:MaxDirectMemorySize=10M -XX:MaxMetaspaceSize=99199
 [Azul Zulu]: https://www.azul.com/products/zulu/
 [Configuration and Extension]: ../README.md#configuration-and-extension
 [Java Buildpack Memory Calculator]: https://github.com/cloudfoundry/java-buildpack-memory-calculator
-[jvmkill-bionic]: https://java-buildpack.cloudfoundry.org/jvmkill/bionic/x86_64/index.yml
+[jvmkill-jammy]: https://java-buildpack.cloudfoundry.org/jvmkill/jammy/x86_64/index.yml
 [Memory Calculator's README]: https://github.com/cloudfoundry/java-buildpack-memory-calculator
 [repositories]: extending-repositories.md
 [version syntax]: extending-repositories.md#version-syntax-and-ordering

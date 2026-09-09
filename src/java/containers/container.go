@@ -1,0 +1,164 @@
+package containers
+
+import (
+	"github.com/cloudfoundry/java-buildpack/src/java/common"
+)
+
+// Container represents a Java application container (Tomcat, Spring Boot, etc.)
+type Container interface {
+	// Detect returns true if this container should handle the application
+	// Returns the container name and version if detected
+	Detect() (string, error)
+
+	// Supply installs the container and its dependencies
+	Supply() error
+
+	// Finalize performs final container configuration
+	Finalize() error
+
+	// Release returns the startup command for the container
+	Release() (string, error)
+}
+
+// Registry manages available containers
+type Registry struct {
+	containers []Container
+	context    *common.Context
+}
+
+// NewRegistry creates a new container registry
+func NewRegistry(ctx *common.Context) *Registry {
+	return &Registry{
+		containers: []Container{},
+		context:    ctx,
+	}
+}
+
+// Register adds a container to the registry
+func (r *Registry) Register(c Container) {
+	r.containers = append(r.containers, c)
+}
+
+// Detect finds the first container that can handle the application.
+// If JBP_CONFIG_JAVA_MAIN specifies an explicit java_main_class, the Java Main
+// container is selected unconditionally — before the normal priority order —
+// so it can override higher-priority containers such as Spring Boot.
+// Java Main is always registered last (lowest priority), so it is the last element.
+func (r *Registry) Detect() (Container, string, error) {
+	cfg := loadJavaMainConfig(r.context.Log)
+	if cfg.JavaMainClass != "" && len(r.containers) > 0 {
+		if jm, ok := r.containers[len(r.containers)-1].(*JavaMainContainer); ok {
+			name, err := jm.Detect()
+			if err != nil {
+				return nil, "", err
+			}
+			if name != "" {
+				return jm, name, nil
+			}
+		} else {
+			r.context.Log.Warning("JBP_CONFIG_JAVA_MAIN java_main_class is set but JavaMain container is not available; ignoring override")
+		}
+	}
+
+	for _, container := range r.containers {
+		name, err := container.Detect()
+		if err != nil {
+			// Propagate errors (e.g., validation failures)
+			return nil, "", err
+		}
+		if name != "" {
+			return container, name, nil
+		}
+	}
+	return nil, "", nil
+}
+
+// DetectAll returns all containers that can handle the application
+func (r *Registry) DetectAll() ([]Container, []string, error) {
+	var matched []Container
+	var names []string
+
+	for _, container := range r.containers {
+		name, err := container.Detect()
+		if err != nil {
+			// Propagate errors (e.g., validation failures)
+			return nil, nil, err
+		}
+		if name != "" {
+			matched = append(matched, container)
+			names = append(names, name)
+		}
+	}
+
+	return matched, names, nil
+}
+
+// Get returns the container whose Detect() returns the given name, or nil if not found.
+// Used by the finalize phase to resolve a container by the name stored in config.yml.
+func (r *Registry) Get(name string) Container {
+	for _, container := range r.containers {
+		detected, err := container.Detect()
+		if err == nil && detected == name {
+			return container
+		}
+	}
+	return nil
+}
+
+// RegisterStandardContainers registers all standard containers in the correct priority order.
+// This ensures Supply and Finalize phases use the same detection order.
+// IMPORTANT: The order matters! Containers are checked in registration order.
+// More specific containers (with stricter detection rules) must come before generic ones.
+func (r *Registry) RegisterStandardContainers() {
+	// Priority order (most specific to least specific):
+	// 1. Spring Boot - checks for BOOT-INF or Spring Boot JAR markers
+	// 2. Tomcat - checks for WEB-INF or WAR files
+	// 3. Groovy - checks for Groovy files (with main method OR shebang)
+	// 4. Play - checks for Play Framework structure
+	// 5. DistZip - checks for bin/ and lib/ directories
+	// 6. JavaMain - checks for executable JAR with Main-Class manifest entry
+	r.Register(NewSpringBootContainer(r.context))
+	r.Register(NewTomcatContainer(r.context))
+	r.Register(NewGroovyContainer(r.context))
+	r.Register(NewPlayContainer(r.context))
+	r.Register(NewDistZipContainer(r.context))
+	r.Register(NewJavaMainContainer(r.context))
+}
+
+// JavaExecCommand builds a start command of the form:
+//
+//	exec $DEPS_DIR/<idx>/bin/javaexec "$JAVA_HOME/bin/java" <javaArgs>
+//
+// The javaexec launcher reads JAVA_OPTS from the environment and tokenizes it
+// without a shell, so glob characters, quotes, and shell metacharacters in
+// user-provided JAVA_OPTS are never expanded or executed. This replaces the
+// previous `eval "exec $JAVA_HOME/bin/java $JAVA_OPTS <javaArgs>"` form, which
+// let the shell glob-expand $JAVA_OPTS and execute embedded command
+// substitutions.
+//
+// javaArgs are buildpack-generated (jar paths, Main-Class, classpath, and
+// shell expansions like ${CLASSPATH} or BOOT-INF/lib/*) and are placed on a
+// normal command line, where the shell expands them exactly as before.
+func JavaExecCommand(depsIdx, javaArgs string) string {
+	return `exec $DEPS_DIR/` + depsIdx + `/bin/javaexec "$JAVA_HOME/bin/java" ` + javaArgs
+}
+
+// This script is used to process the CLASSPATH assembled from various framework scripts sourced from profile.d
+// to further create symlinks to the corresponding framework dependencies in WEB-INF/lib, BOOT-INF/lib and where ever
+// needed thus they are available for application classloading
+var symlinkScript = `#!/bin/bash
+set -euo pipefail
+TARGET_DIR="$PWD/%s"
+CLASSPATH=${CLASSPATH:-}
+mkdir -p "$TARGET_DIR"
+# Split CLASSPATH on :
+IFS=':' read -ra PATHS <<< "$CLASSPATH"
+for p in "${PATHS[@]}"; do
+    # Skip empty entries
+    [[ -z "$p" ]] && continue
+    name=$(basename "$p")
+    link="$TARGET_DIR/$name"
+    ln -sf "$p" "$link"
+    echo "Created symlink: $link -> $p"
+done
+`
